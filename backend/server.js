@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS roles (
   can_create_work_orders INTEGER NOT NULL DEFAULT 0,
   can_manage_reports INTEGER NOT NULL DEFAULT 0,      -- edit severity / delete a report (everyone can always file one)
   can_approve_permits INTEGER NOT NULL DEFAULT 0,     -- approve/close a work permit (everyone can always request one)
+  can_manage_subcategories INTEGER NOT NULL DEFAULT 0, -- add/remove truck & trailer subcategories
   created_at INTEGER NOT NULL
 );
 
@@ -124,15 +125,12 @@ CREATE TABLE IF NOT EXISTS maintenance_logs (
 
 CREATE TABLE IF NOT EXISTS work_permits (
   id TEXT PRIMARY KEY,
-  vehicle_id TEXT NOT NULL,
-  unit_number TEXT,
   type TEXT NOT NULL,                        -- 'hotwork' | 'enclosedspace' | 'heightwork'
   status TEXT NOT NULL DEFAULT 'requested',  -- 'requested' -> 'approved' -> 'closed'
   data TEXT NOT NULL,                        -- JSON blob; shape depends on permit type and stage
   requested_by_user_id TEXT, requested_by_name TEXT, requested_at INTEGER,
   approved_by_user_id TEXT, approved_by_name TEXT, approved_at INTEGER,
-  closed_by_user_id TEXT, closed_by_name TEXT, closed_at INTEGER,
-  FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE
+  closed_by_user_id TEXT, closed_by_name TEXT, closed_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -182,10 +180,34 @@ try { db.exec('ALTER TABLE reports ADD COLUMN resolved_work_order_id TEXT'); } c
 [
   'can_view_all_locations', 'can_move_vehicle_location', 'can_manage_vehicles', 'can_manage_photos',
   'can_view_parts', 'can_manage_parts', 'can_edit_vehicle_info', 'can_manage_maintenance',
-  'can_create_work_orders', 'can_manage_reports', 'can_approve_permits',
+  'can_create_work_orders', 'can_manage_reports', 'can_approve_permits', 'can_manage_subcategories',
 ].forEach((col) => {
   try { db.exec(`ALTER TABLE roles ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`); } catch (e) { /* column already exists */ }
 });
+
+// Migration for servers that predate work permits being decoupled from units:
+// rebuild the table without vehicle_id/unit_number (SQLite can't drop a
+// NOT NULL column in place). Existing permits are preserved.
+try {
+  const cols = db.prepare("PRAGMA table_info(work_permits)").all();
+  if (cols.some((c) => c.name === 'vehicle_id')) {
+    db.exec(`
+      CREATE TABLE work_permits_new (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'requested',
+        data TEXT NOT NULL,
+        requested_by_user_id TEXT, requested_by_name TEXT, requested_at INTEGER,
+        approved_by_user_id TEXT, approved_by_name TEXT, approved_at INTEGER,
+        closed_by_user_id TEXT, closed_by_name TEXT, closed_at INTEGER
+      );
+      INSERT INTO work_permits_new (id, type, status, data, requested_by_user_id, requested_by_name, requested_at, approved_by_user_id, approved_by_name, approved_at, closed_by_user_id, closed_by_name, closed_at)
+        SELECT id, type, status, data, requested_by_user_id, requested_by_name, requested_at, approved_by_user_id, approved_by_name, approved_at, closed_by_user_id, closed_by_name, closed_at FROM work_permits;
+      DROP TABLE work_permits;
+      ALTER TABLE work_permits_new RENAME TO work_permits;
+    `);
+  }
+} catch (e) { console.warn('work_permits migration skipped:', e.message); }
 
 function uid() {
   return crypto.randomBytes(12).toString('hex');
@@ -257,11 +279,11 @@ const seedTxn = db.transaction(() => {
     INSERT INTO roles (
       id, label, is_admin, can_view_all_locations, can_move_vehicle_location, can_manage_vehicles,
       can_manage_photos, can_view_parts, can_manage_parts, can_edit_vehicle_info,
-      can_manage_maintenance, can_create_work_orders, can_manage_reports, can_approve_permits, created_at
+      can_manage_maintenance, can_create_work_orders, can_manage_reports, can_approve_permits, can_manage_subcategories, created_at
     ) VALUES (
       @id, @label, @is_admin, @can_view_all_locations, @can_move_vehicle_location, @can_manage_vehicles,
       @can_manage_photos, @can_view_parts, @can_manage_parts, @can_edit_vehicle_info,
-      @can_manage_maintenance, @can_create_work_orders, @can_manage_reports, @can_approve_permits, @created_at
+      @can_manage_maintenance, @can_create_work_orders, @can_manage_reports, @can_approve_permits, @can_manage_subcategories, @created_at
     )
     ON CONFLICT(id) DO UPDATE SET
       label = excluded.label, is_admin = excluded.is_admin,
@@ -275,7 +297,8 @@ const seedTxn = db.transaction(() => {
       can_manage_maintenance = excluded.can_manage_maintenance,
       can_create_work_orders = excluded.can_create_work_orders,
       can_manage_reports = excluded.can_manage_reports,
-      can_approve_permits = excluded.can_approve_permits
+      can_approve_permits = excluded.can_approve_permits,
+      can_manage_subcategories = excluded.can_manage_subcategories
   `);
   const now = Date.now();
   const full = 1;
@@ -283,27 +306,27 @@ const seedTxn = db.transaction(() => {
     // Administrator: everything, including roles/logo/import-export (is_admin=1).
     {id:'admin', label:'Administrator', is_admin:full, can_view_all_locations:full, can_move_vehicle_location:full,
      can_manage_vehicles:full, can_manage_photos:full, can_view_parts:full, can_manage_parts:full,
-     can_edit_vehicle_info:full, can_manage_maintenance:full, can_create_work_orders:full, can_manage_reports:full, can_approve_permits:full},
+     can_edit_vehicle_info:full, can_manage_maintenance:full, can_create_work_orders:full, can_manage_reports:full, can_approve_permits:full, can_manage_subcategories:full},
     // Fleet Manager: identical to Administrator except role management/logo/import-export.
     {id:'fleetmanager', label:'Fleet Manager', is_admin:0, can_view_all_locations:full, can_move_vehicle_location:full,
      can_manage_vehicles:full, can_manage_photos:full, can_view_parts:full, can_manage_parts:full,
-     can_edit_vehicle_info:full, can_manage_maintenance:full, can_create_work_orders:full, can_manage_reports:full, can_approve_permits:full},
+     can_edit_vehicle_info:full, can_manage_maintenance:full, can_create_work_orders:full, can_manage_reports:full, can_approve_permits:full, can_manage_subcategories:full},
     // Supervisor: broad read access and management, but can't add/remove units,
     // can't touch photos, and doesn't create work orders (that's the Technician's job).
     {id:'supervisor', label:'Supervisor', is_admin:0, can_view_all_locations:full, can_move_vehicle_location:full,
      can_manage_vehicles:0, can_manage_photos:0, can_view_parts:full, can_manage_parts:full,
-     can_edit_vehicle_info:full, can_manage_maintenance:full, can_create_work_orders:0, can_manage_reports:full, can_approve_permits:full},
+     can_edit_vehicle_info:full, can_manage_maintenance:full, can_create_work_orders:0, can_manage_reports:full, can_approve_permits:full, can_manage_subcategories:0},
     // Technician: scoped to their own location, focused on completing work
     // orders and maintenance; can't move a unit to another location.
     {id:'technician', label:'Technician', is_admin:0, can_view_all_locations:0, can_move_vehicle_location:0,
      can_manage_vehicles:0, can_manage_photos:0, can_view_parts:full, can_manage_parts:full,
-     can_edit_vehicle_info:full, can_manage_maintenance:full, can_create_work_orders:full, can_manage_reports:full, can_approve_permits:0},
+     can_edit_vehicle_info:full, can_manage_maintenance:full, can_create_work_orders:full, can_manage_reports:full, can_approve_permits:0, can_manage_subcategories:0},
     // Operator: very limited — scoped to their own location, can file a
     // report with a photo, and otherwise only views (no Parts tab, no
     // editing anything, no photo uploads).
     {id:'operator', label:'Operator', is_admin:0, can_view_all_locations:0, can_move_vehicle_location:0,
      can_manage_vehicles:0, can_manage_photos:0, can_view_parts:0, can_manage_parts:0,
-     can_edit_vehicle_info:0, can_manage_maintenance:0, can_create_work_orders:0, can_manage_reports:0, can_approve_permits:0},
+     can_edit_vehicle_info:0, can_manage_maintenance:0, can_create_work_orders:0, can_manage_reports:0, can_approve_permits:0, can_manage_subcategories:0},
   ].forEach(r => roleUpsert.run(Object.assign({created_at: now}, r)));
 });
 seedTxn();
@@ -363,7 +386,7 @@ function getCapabilities(userId) {
   const empty = {
     is_admin:0, can_view_all_locations:0, can_move_vehicle_location:0, can_manage_vehicles:0,
     can_manage_photos:0, can_view_parts:0, can_manage_parts:0, can_edit_vehicle_info:0,
-    can_manage_maintenance:0, can_create_work_orders:0, can_manage_reports:0, can_approve_permits:0,
+    can_manage_maintenance:0, can_create_work_orders:0, can_manage_reports:0, can_approve_permits:0, can_manage_subcategories:0,
   };
   if (!row) return empty;
   return Object.assign({}, empty, row);
@@ -439,6 +462,7 @@ function publicUser(row) {
       canCreateWorkOrders: !!caps.can_create_work_orders,
       canManageReports: !!caps.can_manage_reports,
       canApprovePermits: !!caps.can_approve_permits,
+      canManageSubcategories: !!caps.can_manage_subcategories,
     },
     avatar: row.avatar || null,
     jobPosition: row.job_position || '',
@@ -507,11 +531,36 @@ app.get('/api/users', requireAuth, (req, res) => {
 // location — the only fields a non-admin user is allowed to change about themselves.
 app.patch('/api/users/me/profile', requireAuth, (req, res) => {
   const { avatar, jobPosition, phone, email, locationId } = req.body || {};
+  const isAdmin = hasCapability(req.user.sub, 'is_admin');
+  // Only Administrators can set their own working location — everyone else's
+  // location is assigned to them by an admin.
+  const current = db.prepare('SELECT location_id FROM users WHERE id = ?').get(req.user.sub);
+  const finalLocationId = isAdmin ? (locationId || null) : (current ? current.location_id : null);
   db.prepare(`
     UPDATE users SET avatar = ?, job_position = ?, phone = ?, email = ?, location_id = ?
     WHERE id = ?
-  `).run(avatar || null, (jobPosition||'').trim(), (phone||'').trim(), (email||'').trim(), locationId || null, req.user.sub);
+  `).run(avatar || null, (jobPosition||'').trim(), (phone||'').trim(), (email||'').trim(), finalLocationId, req.user.sub);
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.sub);
+  res.json({ user: publicUser(user) });
+});
+
+// Admin-only: edit any user's full profile, including their location.
+app.patch('/api/users/:id/profile', requireAuth, requireAdmin, (req, res) => {
+  const { name, avatar, jobPosition, phone, email, locationId } = req.body || {};
+  const existing = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'User not found.' });
+  db.prepare(`
+    UPDATE users SET name = ?, avatar = ?, job_position = ?, phone = ?, email = ?, location_id = ?
+    WHERE id = ?
+  `).run(
+    (name || existing.name).trim(), avatar !== undefined ? avatar : existing.avatar,
+    (jobPosition !== undefined ? jobPosition : existing.job_position || '').trim(),
+    (phone !== undefined ? phone : existing.phone || '').trim(),
+    (email !== undefined ? email : existing.email || '').trim(),
+    locationId !== undefined ? (locationId || null) : existing.location_id,
+    req.params.id
+  );
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
   res.json({ user: publicUser(user) });
 });
 
@@ -535,6 +584,7 @@ function roleToClient(r) {
       canCreateWorkOrders: !!r.can_create_work_orders,
       canManageReports: !!r.can_manage_reports,
       canApprovePermits: !!r.can_approve_permits,
+      canManageSubcategories: !!r.can_manage_subcategories,
     },
   };
 }
@@ -637,12 +687,7 @@ app.get('/api/state', requireAuth, (req, res) => {
     });
   });
 
-  const permitRows = db.prepare('SELECT * FROM work_permits ORDER BY requested_at DESC').all();
-  const permitsByVehicle = {};
-  permitRows.forEach((p) => {
-    if (!permitsByVehicle[p.vehicle_id]) permitsByVehicle[p.vehicle_id] = [];
-    permitsByVehicle[p.vehicle_id].push(permitToClient(p));
-  });
+  const permits = db.prepare('SELECT * FROM work_permits ORDER BY requested_at DESC').all().map(permitToClient);
 
   let vehicles = vehicleRows.map((row) => {
     const parsed = JSON.parse(row.data);
@@ -651,7 +696,6 @@ app.get('/api/state', requireAuth, (req, res) => {
     parsed.reports = reportsByVehicle[row.id] || [];
     parsed.workOrders = workOrdersByVehicle[row.id] || [];
     parsed.maintenanceLogs = maintLogsByVehicle[row.id] || [];
-    parsed.permits = permitsByVehicle[row.id] || [];
     return parsed;
   });
 
@@ -685,6 +729,7 @@ app.get('/api/state', requireAuth, (req, res) => {
     vehicles,
     events,
     roles,
+    permits,
     companyLogo: logoRow ? logoRow.value : null,
   });
 });
@@ -769,7 +814,6 @@ app.delete('/api/vehicles/:id', requireAuth, requireCapability('can_manage_vehic
   db.prepare('DELETE FROM events WHERE vehicle_id = ?').run(req.params.id);
   db.prepare('DELETE FROM work_orders WHERE vehicle_id = ?').run(req.params.id);
   db.prepare('DELETE FROM maintenance_logs WHERE vehicle_id = ?').run(req.params.id);
-  db.prepare('DELETE FROM work_permits WHERE vehicle_id = ?').run(req.params.id);
   res.json({ ok: true });
 });
 
@@ -980,8 +1024,6 @@ const VALID_PERMIT_TYPES = ['hotwork', 'enclosedspace', 'heightwork'];
 function permitToClient(p) {
   return {
     id: p.id,
-    vehicleId: p.vehicle_id,
-    unitNumber: p.unit_number,
     type: p.type,
     status: p.status,
     data: JSON.parse(p.data || '{}'),
@@ -997,21 +1039,15 @@ function permitToClient(p) {
   };
 }
 
-// Any authenticated user can request a permit for a unit they can access.
-app.post('/api/vehicles/:vehicleId/permits', requireAuth, (req, res) => {
-  const { vehicleId } = req.params;
+// Any authenticated user can request a permit — permits are standalone
+// safety documents, not tied to any particular unit.
+app.post('/api/permits', requireAuth, (req, res) => {
   const { type, data } = req.body || {};
   if (!VALID_PERMIT_TYPES.includes(type)) return res.status(400).json({ error: 'A valid permit type is required.' });
-  const vehicleRow = db.prepare('SELECT data FROM vehicles WHERE id = ?').get(vehicleId);
-  if (!vehicleRow) return res.status(404).json({ error: 'Vehicle not found.' });
-  if (!enforceVehicleAccess(req, res, vehicleId)) return;
-  const vehicleData = JSON.parse(vehicleRow.data);
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.sub);
 
   const permit = {
     id: uid(),
-    vehicle_id: vehicleId,
-    unit_number: vehicleData.unitNumber || '',
     type,
     status: 'requested',
     data: JSON.stringify(data || {}),
@@ -1020,8 +1056,8 @@ app.post('/api/vehicles/:vehicleId/permits', requireAuth, (req, res) => {
     requested_at: Date.now(),
   };
   db.prepare(`
-    INSERT INTO work_permits (id, vehicle_id, unit_number, type, status, data, requested_by_user_id, requested_by_name, requested_at)
-    VALUES (@id, @vehicle_id, @unit_number, @type, @status, @data, @requested_by_user_id, @requested_by_name, @requested_at)
+    INSERT INTO work_permits (id, type, status, data, requested_by_user_id, requested_by_name, requested_at)
+    VALUES (@id, @type, @status, @data, @requested_by_user_id, @requested_by_name, @requested_at)
   `).run(permit);
 
   res.json({ permit: permitToClient(db.prepare('SELECT * FROM work_permits WHERE id = ?').get(permit.id)) });
@@ -1032,7 +1068,6 @@ app.post('/api/vehicles/:vehicleId/permits', requireAuth, (req, res) => {
 app.patch('/api/permits/:id/approve', requireAuth, requireCapability('can_approve_permits'), (req, res) => {
   const permit = db.prepare('SELECT * FROM work_permits WHERE id = ?').get(req.params.id);
   if (!permit) return res.status(404).json({ error: 'Permit not found.' });
-  if (!enforceVehicleAccess(req, res, permit.vehicle_id)) return;
   if (permit.status !== 'requested') return res.status(409).json({ error: 'This permit has already been approved.' });
 
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.sub);
@@ -1049,7 +1084,6 @@ app.patch('/api/permits/:id/approve', requireAuth, requireCapability('can_approv
 app.patch('/api/permits/:id/close', requireAuth, requireCapability('can_approve_permits'), (req, res) => {
   const permit = db.prepare('SELECT * FROM work_permits WHERE id = ?').get(req.params.id);
   if (!permit) return res.status(404).json({ error: 'Permit not found.' });
-  if (!enforceVehicleAccess(req, res, permit.vehicle_id)) return;
   if (permit.status !== 'approved') return res.status(409).json({ error: 'This permit must be approved before it can be closed.' });
 
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.sub);
@@ -1066,7 +1100,6 @@ app.patch('/api/permits/:id/close', requireAuth, requireCapability('can_approve_
 app.post('/api/permits/:id/readings', requireAuth, requireCapability('can_approve_permits'), (req, res) => {
   const permit = db.prepare('SELECT * FROM work_permits WHERE id = ?').get(req.params.id);
   if (!permit) return res.status(404).json({ error: 'Permit not found.' });
-  if (!enforceVehicleAccess(req, res, permit.vehicle_id)) return;
   const data = JSON.parse(permit.data || '{}');
   data.hourlyReadings = data.hourlyReadings || [];
   data.hourlyReadings.push(Object.assign({}, req.body.reading || {}, { at: Date.now() }));
@@ -1075,17 +1108,14 @@ app.post('/api/permits/:id/readings', requireAuth, requireCapability('can_approv
 });
 
 app.delete('/api/permits/:id', requireAuth, requireCapability('can_approve_permits'), (req, res) => {
-  const permit = db.prepare('SELECT vehicle_id FROM work_permits WHERE id = ?').get(req.params.id);
-  if (permit && !enforceVehicleAccess(req, res, permit.vehicle_id)) return;
   db.prepare('DELETE FROM work_permits WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
 });
 
-// Global history across every unit, for the hamburger-menu Work Permits view.
+// Global history — permits are standalone, so every authenticated user sees
+// the same full list (no per-unit location scoping applies anymore).
 app.get('/api/permits', requireAuth, (req, res) => {
-  const scope = getAccessScope(req.user.sub);
-  let rows = db.prepare('SELECT * FROM work_permits ORDER BY requested_at DESC').all();
-  if (scope.restricted) rows = rows.filter((p) => vehicleLocationOf(p.vehicle_id) === scope.locationId);
+  const rows = db.prepare('SELECT * FROM work_permits ORDER BY requested_at DESC').all();
   res.json({ permits: rows.map(permitToClient) });
 });
 
@@ -1144,7 +1174,7 @@ app.put('/api/locations', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.put('/api/subcategories', requireAuth, (req, res) => {
+app.put('/api/subcategories', requireAuth, requireCapability('can_manage_subcategories'), (req, res) => {
   const subcategories = req.body.subcategories || {};
   const txn = db.transaction((obj) => {
     db.prepare('DELETE FROM subcategories').run();

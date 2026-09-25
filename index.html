@@ -275,9 +275,9 @@
     display:flex;align-items:center;justify-content:center;
   }
 
-  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;display:flex;align-items:flex-end;justify-content:center;}
-  .modal{background:var(--surface);width:100%;max-width:480px;border-radius:16px 16px 0 0;padding:20px 18px 26px;max-height:88vh;overflow-y:auto;}
-  .modal-handle{width:40px;height:4px;background:var(--stroke);border-radius:2px;margin:0 auto 16px;}
+  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;display:flex;align-items:center;justify-content:center;padding:20px;}
+  .modal{background:var(--surface);width:100%;max-width:480px;border-radius:16px;padding:24px 20px 22px;max-height:86vh;overflow-y:auto;position:relative;}
+  .modal-close-x{position:absolute;top:12px;right:12px;width:30px;height:30px;border-radius:50%;background:var(--surface-raised);border:1px solid var(--stroke);color:var(--text);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:1;}
   .modal-actions{display:flex;gap:10px;margin-top:18px;}
   .modal-actions .btn{flex:1;}
 
@@ -755,6 +755,7 @@ const I18N = {
     profileSavedTitle: "Profile Saved",
     roleLabel: "Role",
     noRoleLabel: "No role assigned",
+    locationAdminOnlyNote: "Only an administrator can change your working location.",
     manageUsersTitle: "Manage Users & Roles",
     addRoleAction: "+ Add Role",
     loadingLabel: "Loading…",
@@ -1081,6 +1082,7 @@ const I18N = {
     profileSavedTitle: "Profil enregistré",
     roleLabel: "Rôle",
     noRoleLabel: "Aucun rôle attribué",
+    locationAdminOnlyNote: "Seul un administrateur peut modifier votre emplacement de travail.",
     manageUsersTitle: "Gérer les utilisateurs et les rôles",
     addRoleAction: "+ Ajouter un rôle",
     loadingLabel: "Chargement…",
@@ -1234,7 +1236,7 @@ function statusLabel(statusId){
    ========================================================= */
 // Point this at your deployed ezfleet-server URL, e.g. 'https://ezfleet-api.onrender.com'.
 // Leave as '' only if this page is served from the exact same origin as the API.
-const API_BASE_URL = 'https://ezfleet.up.railway.app';
+const API_BASE_URL = '';
 
 const TOKEN_KEY = 'ezfleet_token';
 const CURRENT_USER_KEY = 'ezfleet_current_user';
@@ -1451,6 +1453,7 @@ function loadDB(){
       if(!parsed.partCategories) parsed.partCategories = DEFAULT_PART_CATEGORIES.slice();
       if(!parsed.events) parsed.events = [];
       if(!parsed.roles) parsed.roles = [];
+      if(!parsed.permits) parsed.permits = [];
       mergeDefaultSubcategories(parsed);
       return parsed;
     }
@@ -1462,6 +1465,7 @@ function loadDB(){
     partCategories: DEFAULT_PART_CATEGORIES.slice(),
     events: [],
     roles: [],
+    permits: [],
     vehicles:[],
     language: 'en',
   };
@@ -1482,8 +1486,10 @@ async function syncStateToServer(){
   const calls = [
     apiFetch('/api/vehicles', {method:'PUT', body: JSON.stringify({vehicles: vehiclesPayload})}),
     apiFetch('/api/locations', {method:'PUT', body: JSON.stringify({locations: DB.locations})}),
-    apiFetch('/api/subcategories', {method:'PUT', body: JSON.stringify({subcategories: DB.subcategories})}),
   ];
+  if(can('canManageSubcategories')){
+    calls.push(apiFetch('/api/subcategories', {method:'PUT', body: JSON.stringify({subcategories: DB.subcategories})}));
+  }
   if(can('canManageParts')){
     calls.push(apiFetch('/api/partCategories', {method:'PUT', body: JSON.stringify({partCategories: DB.partCategories})}));
   }
@@ -1504,8 +1510,45 @@ async function hydrateFromServer(){
   DB.vehicles = state.vehicles || [];
   DB.events = state.events || [];
   DB.roles = state.roles || [];
+  DB.permits = state.permits || [];
   if(state.companyLogo) DB.companyLogo = state.companyLogo;
   localStorage.setItem(DB_KEY, JSON.stringify(DB));
+}
+
+/* =========================================================
+   LIVE SYNC — polls the server every few seconds so everyone sees
+   everyone else's changes without needing to refresh the page.
+   Skips a cycle (rather than disrupting the user) if a modal is open
+   or they're actively typing in a field.
+   ========================================================= */
+const LIVE_POLL_INTERVAL_MS = 5000;
+let _pollTimer = null;
+function startLivePolling(){
+  stopLivePolling();
+  _pollTimer = setInterval(pollForUpdates, LIVE_POLL_INTERVAL_MS);
+}
+function stopLivePolling(){
+  if(_pollTimer){ clearInterval(_pollTimer); _pollTimer = null; }
+}
+function safeToLiveRefresh(){
+  if($('modalRoot') && $('modalRoot').innerHTML.trim().length > 0) return false; // don't yank an open form away
+  const active = document.activeElement;
+  if(active && (active.tagName==='INPUT' || active.tagName==='TEXTAREA' || active.tagName==='SELECT')) return false; // don't interrupt typing
+  return true;
+}
+async function pollForUpdates(){
+  if(!$('screen-login') || !$('screen-login').classList.contains('hidden')) return; // not logged in yet
+  if(!safeToLiveRefresh()) return; // try again next tick
+  try{
+    await hydrateFromServer();
+    if(!safeToLiveRefresh()) return; // re-check: state may have changed mid-fetch
+    if(!$('screen-main').classList.contains('hidden')){
+      _renderMainInner();
+    } else if(!$('screen-detail').classList.contains('hidden')){
+      if(state.currentPermitId) renderPermitDetailView();
+      else renderDetail();
+    }
+  }catch(e){ /* offline or server hiccup — silently retry next interval */ }
 }
 
 let DB = loadDB();
@@ -1526,6 +1569,11 @@ let state = {
 
 function $(id){ return document.getElementById(id); }
 function esc(s){ return (s==null?'':String(s)).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+// Price fields only ever allow digits and commas (no letters, no other symbols).
+function sanitizePriceInput(el){
+  const cleaned = el.value.replace(/[^0-9,]/g, '');
+  if(cleaned !== el.value) el.value = cleaned;
+}
 
 /* =========================================================
    LANGUAGE
@@ -1620,16 +1668,18 @@ async function enterApp(){
   $('screen-login').classList.add('hidden');
   $('screen-main').classList.remove('hidden');
   applyLogoEverywhere();
-  renderHome();
+  renderHome(); // instant placeholder while we hydrate
   try{
     await hydrateFromServer();
-    if(state.view==='home') renderHome();
+    if(!restoreNavState()) renderHome();
   }catch(e){
     console.warn('Could not load latest data from server, showing local cache:', e.message);
     showToast({ kind:'due', icon:'📡', title: t('offlineModeTitle'), subtitle: t('offlineModeSub') });
+    if(!restoreNavState()) renderHome();
   }
   setTimeout(checkMaintenanceNotifications, 500);
   setTimeout(checkEventReminders, 900);
+  startLivePolling();
 }
 
 // Try to resume a previous session on page load (token still valid = skip login screen).
@@ -1646,6 +1696,7 @@ async function tryResumeSession(){
 }
 
 function logout(){
+  stopLivePolling();
   clearToken();
   localStorage.removeItem(CURRENT_USER_KEY);
   closeDrawer();
@@ -1872,7 +1923,50 @@ function deleteSubcategory(catId, subId, context){
 /* =========================================================
    HOME / CATEGORY / LOCATION / SEARCH RENDER
    ========================================================= */
+const NAV_STATE_KEY = 'ezfleet_nav_state';
+function persistNavState(){
+  try{
+    localStorage.setItem(NAV_STATE_KEY, JSON.stringify({
+      view: state.view, category: state.category, location: state.location,
+      currentVehicleId: state.currentVehicleId, detailTab: state.detailTab,
+      currentPermitId: state.currentPermitId,
+    }));
+  }catch(e){ /* ignore quota errors */ }
+}
+// Returns true if it successfully navigated somewhere from a saved session;
+// false means the caller should fall back to Home.
+function restoreNavState(){
+  try{
+    const raw = localStorage.getItem(NAV_STATE_KEY);
+    if(!raw) return false;
+    const saved = JSON.parse(raw);
+    if(!saved || !saved.view) return false;
+    if(saved.currentPermitId){
+      openPermitDetailView(saved.currentPermitId);
+      return true;
+    }
+    if(saved.currentVehicleId && DB.vehicles.some(v=>v.id===saved.currentVehicleId)){
+      state.detailTab = saved.detailTab || 'info';
+      openVehicle(saved.currentVehicleId);
+      return true;
+    }
+    if(saved.view==='category' && saved.category){ goToCategory(saved.category); return true; }
+    if(saved.view==='location' && saved.location){ goToLocation(saved.location); return true; }
+    if(saved.view==='options'){ goToOptions(); return true; }
+    if(saved.view==='calendar'){ goToCalendar(); return true; }
+    if(saved.view==='reports'){ goToReports(); return true; }
+    if(saved.view==='workorders'){ goToWorkOrders(); return true; }
+    if(saved.view==='maintenancelogs'){ goToMaintenanceLogs(); return true; }
+    if(saved.view==='permits'){ goToPermits(); return true; }
+    return false;
+  }catch(e){ return false; }
+}
+
 function renderMain(){
+  _renderMainInner();
+  persistNavState();
+}
+function _renderMainInner(){
   if(state.view==='home') return renderHome();
   if(state.view==='category') return renderCategory(state.category);
   if(state.view==='location') return renderLocation(state.location);
@@ -1951,7 +2045,9 @@ function subcategoryChipRowHtml(catId){
   subs.forEach(s=>{
     html += `<button class="tab-btn ${state.subcategory===s.id?'active':''}" onclick="setSubcategoryFilter('${s.id}')">${esc(subcategoryDisplayLabel(catId, s.id, s.label))}</button>`;
   });
-  html += `<button class="tab-btn" onclick="openAddSubcategoryModal('${catId}','filter')">+ ${t('subcategoryLabel')}</button>`;
+  if(can('canManageSubcategories')){
+    html += `<button class="tab-btn" onclick="openAddSubcategoryModal('${catId}','filter')">+ ${t('subcategoryLabel')}</button>`;
+  }
   html += `</div>`;
   return html;
 }
@@ -1962,6 +2058,7 @@ function renderCategory(catId){
   const cat = CATEGORIES.find(c=>c.id===catId);
   const label = catLabel(catId);
   $('fabAdd').classList.toggle('hidden', !can('canManageVehicles'));
+  $('fabAdd').onclick = openAddVehicleModal;
   let list = DB.vehicles.filter(v=>v.category===catId);
   if(state.subcategory) list = list.filter(v=>v.subcategory===state.subcategory);
   let html = subcategoryChipRowHtml(catId);
@@ -1979,6 +2076,7 @@ function renderLocation(locId){
   state.view='location'; state.location=locId;
   const loc = DB.locations.find(c=>c.id===locId);
   $('fabAdd').classList.toggle('hidden', !can('canManageVehicles'));
+  $('fabAdd').onclick = openAddVehicleModal;
   const list = DB.vehicles.filter(v=>v.location===locId);
   let html = `<div class="section-title">📍 ${esc(loc.label)} — ${list.length} ${t('onFileSuffix')}</div>`;
   if(!list.length){
@@ -2104,12 +2202,15 @@ function renderOptions(){
       <div class="field"><label>${t('jobPositionLabel')}</label><input id="profJobPosition" placeholder="${t('jobPositionPlaceholder')}" value="${esc(me?me.jobPosition:'')}"></div>
       <div class="field"><label>${t('phoneLabel')}</label><input id="profPhone" type="tel" placeholder="${t('phonePlaceholder')}" value="${esc(me?me.phone:'')}"></div>
       <div class="field"><label>${t('emailLabel')}</label><input id="profEmail" type="email" placeholder="${t('emailPlaceholder')}" value="${esc(me?me.email:'')}"></div>
-      <div class="field"><label>${t('workLocationLabel')}</label>
+      ${me && me.isAdmin
+        ? `<div class="field"><label>${t('workLocationLabel')}</label>
         <select id="profLocation">
           <option value="">—</option>
           ${DB.locations.map(l=>`<option value="${l.id}" ${me&&me.locationId===l.id?'selected':''}>${esc(l.label)}</option>`).join('')}
         </select>
-      </div>
+      </div>`
+        : `<div class="field"><label>${t('workLocationLabel')}</label><div class="card" style="padding:10px 12px;">${esc((DB.locations.find(l=>l.id===(me&&me.locationId))||{}).label)||'—'}</div>
+        <div class="muted" style="font-size:11.5px;margin-top:4px;">${t('locationAdminOnlyNote')}</div></div>`}
       <button class="btn btn-block" onclick="saveMyProfile()">${t('saveProfileBtn')}</button>
     </div>
 
@@ -2142,12 +2243,13 @@ function handleAvatarChange(e){
 }
 async function saveMyProfile(){
   const me = getCurrentUser();
+  const locEl = $('profLocation');
   const payload = {
     avatar: _pendingAvatarData !== null ? _pendingAvatarData : (me ? me.avatar : null),
     jobPosition: $('profJobPosition').value.trim(),
     phone: $('profPhone').value.trim(),
     email: $('profEmail').value.trim(),
-    locationId: $('profLocation').value || null,
+    locationId: locEl ? (locEl.value || null) : (me ? me.locationId : null),
   };
   try{
     const res = await apiFetch('/api/users/me/profile', {method:'PATCH', body: JSON.stringify(payload)});
@@ -2175,22 +2277,64 @@ async function loadAndRenderUserList(){
   if(!wrap) return;
   try{
     const res = await apiFetch('/api/users');
+    _adminUserListCache = res.users;
     const me = getCurrentUser();
     wrap.innerHTML = res.users.map(u=>{
       const profileBits = [u.jobPosition, (DB.locations.find(l=>l.id===u.locationId)||{}).label, u.phone, u.email].filter(Boolean).join(' · ');
-      return `<div class="list-row">
+      return `<div class="list-row" style="cursor:pointer;" onclick="openEditUserProfileModal('${u.id}')">
         <div style="min-width:0;">
           <div class="title">${esc(u.name)} ${u.id===(me?me.id:null)?`<span class="muted">(${t('youLabel')})</span>`:''}</div>
           <div class="sub">@${esc(u.username)}</div>
           ${profileBits ? `<div class="sub" style="margin-top:2px;">${esc(profileBits)}</div>` : ''}
         </div>
-        <select style="width:150px;flex-shrink:0;" onchange="updateUserRole('${u.id}', this.value, this)">
+        <select style="width:150px;flex-shrink:0;" onclick="event.stopPropagation()" onchange="updateUserRole('${u.id}', this.value, this)">
           ${DB.roles.map(r=>`<option value="${r.id}" ${u.roleId===r.id?'selected':''}>${esc(roleDisplayLabel(r))}</option>`).join('')}
         </select>
       </div>`;
     }).join('') || `<div class="empty-state" style="padding:12px;">—</div>`;
   }catch(e){
     wrap.innerHTML = `<div class="muted">${esc(e.message||'')}</div>`;
+  }
+}
+let _adminUserListCache = [];
+function openEditUserProfileModal(userId){
+  const u = _adminUserListCache.find(x=>x.id===userId);
+  if(!u) return;
+  showModal(`
+    <h3 style="margin-top:0;">${esc(u.name)}</h3>
+    <div class="muted" style="font-size:12.5px;margin-bottom:14px;">@${esc(u.username)}</div>
+    <div class="field"><label>${t('nameLabel')}</label><input id="euName" value="${esc(u.name)}"></div>
+    <div class="field"><label>${t('jobPositionLabel')}</label><input id="euJobPosition" value="${esc(u.jobPosition||'')}" placeholder="${t('jobPositionPlaceholder')}"></div>
+    <div class="field"><label>${t('phoneLabel')}</label><input id="euPhone" type="tel" value="${esc(u.phone||'')}" placeholder="${t('phonePlaceholder')}"></div>
+    <div class="field"><label>${t('emailLabel')}</label><input id="euEmail" type="email" value="${esc(u.email||'')}" placeholder="${t('emailPlaceholder')}"></div>
+    <div class="field"><label>${t('workLocationLabel')}</label>
+      <select id="euLocation">
+        <option value="">—</option>
+        ${DB.locations.map(l=>`<option value="${l.id}" ${u.locationId===l.id?'selected':''}>${esc(l.label)}</option>`).join('')}
+      </select>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">${t('cancelBtn')}</button>
+      <button class="btn" onclick="submitEditUserProfile('${u.id}')">${t('saveProfileBtn')}</button>
+    </div>
+  `);
+}
+async function submitEditUserProfile(userId){
+  const payload = {
+    name: $('euName').value.trim(),
+    jobPosition: $('euJobPosition').value.trim(),
+    phone: $('euPhone').value.trim(),
+    email: $('euEmail').value.trim(),
+    locationId: $('euLocation').value || null,
+  };
+  if(!payload.name){ alert(t('registerFieldsRequired')); return; }
+  try{
+    await apiFetch(`/api/users/${userId}/profile`, {method:'PATCH', body: JSON.stringify(payload)});
+    closeModal();
+    showToast({ kind:'info', icon:'👤', title: t('profileSavedTitle') });
+    loadAndRenderUserList();
+  }catch(e){
+    alert(e.message || t('registerFailed'));
   }
 }
 async function updateUserRole(userId, roleId, selectEl){
@@ -2274,10 +2418,13 @@ function subcategoryFieldHtml(catId, selectedId, selectId, onChangeAttr, context
   if(catId!=='truck' && catId!=='trailer') return '';
   const list = DB.subcategories[catId] || [];
   const opts = `<option value="">—</option>` + list.map(s=>`<option value="${s.id}" ${selectedId===s.id?'selected':''}>${esc(subcategoryDisplayLabel(catId, s.id, s.label))}</option>`).join('');
+  const addBtn = can('canManageSubcategories')
+    ? `<button type="button" class="btn btn-secondary" style="padding:0 16px;" onclick="openAddSubcategoryModal('${catId}','${context}')">+</button>`
+    : '';
   return `<div class="field"><label>${t('subcategoryLabel')}</label>
     <div style="display:flex;gap:8px;">
       <select id="${selectId}" style="flex:1;" ${onChangeAttr||''}>${opts}</select>
-      <button type="button" class="btn btn-secondary" style="padding:0 16px;" onclick="openAddSubcategoryModal('${catId}','${context}')">+</button>
+      ${addBtn}
     </div>
   </div>`;
 }
@@ -2355,8 +2502,11 @@ function createVehicle(){
    ========================================================= */
 function showModal(innerHtml){
   $('modalRoot').innerHTML = `
-    <div class="modal-overlay" onclick="if(event.target===this) closeModal()">
-      <div class="modal"><div class="modal-handle"></div>${innerHtml}</div>
+    <div class="modal-overlay">
+      <div class="modal">
+        <button class="modal-close-x" onclick="closeModal()" aria-label="Close">✕</button>
+        ${innerHtml}
+      </div>
     </div>`;
 }
 function closeModal(){ $('modalRoot').innerHTML=''; }
@@ -2461,7 +2611,6 @@ function openVehicle(id){
   state.detailTab = 'info';
   state.partsCategoryFilter = null;
   state.currentPermitId = null;
-  state.currentPermitVehicleId = null;
   $('deleteVehicleBtn').classList.remove('hidden');
   $('screen-main').classList.add('hidden');
   $('screen-detail').classList.remove('hidden');
@@ -2499,7 +2648,6 @@ function detailTabsList(){
     {id:'appointments', label:t('tabAppointments')},
     {id:'reports', label:t('tabReports')},
     {id:'workorders', label:t('tabWorkOrders')},
-    {id:'permits', label:t('tabPermits')},
   );
   return tabs;
 }
@@ -2525,6 +2673,7 @@ function renderDetail(){
   ).join('');
 
   renderDetailTabContent();
+  persistNavState();
 }
 function switchDetailTab(tab){ state.detailTab = tab; renderDetail(); }
 
@@ -2540,7 +2689,6 @@ function renderDetailTabContent(){
   else if(state.detailTab==='appointments') el.innerHTML = tabAppointmentsHtml(v);
   else if(state.detailTab==='reports') el.innerHTML = tabReportsHtml(v);
   else if(state.detailTab==='workorders') el.innerHTML = tabWorkOrdersHtml(v);
-  else if(state.detailTab==='permits') el.innerHTML = tabPermitsHtml(v);
 }
 
 /* ---- INFO TAB ---- */
@@ -2763,7 +2911,7 @@ function showPartFormModal(){
           <button type="button" class="btn btn-secondary" style="padding:0 14px;" onclick="openManagePartCategoriesModal()">+</button>
         </div>
       </div>
-      <div class="field"><label>${t('priceLabel2')}</label><input id="pPrice" type="number" step="0.01" value="${editing&&editing.price?esc(editing.price):''}" placeholder="0.00"></div>
+      <div class="field"><label>${t('priceLabel2')}</label><input id="pPrice" type="text" inputmode="decimal" oninput="sanitizePriceInput(this)" value="${editing&&editing.price?esc(editing.price):''}" placeholder="0.00"></div>
     </div>
     <div class="field"><label>${t('partNumberLabel')}</label><input id="pNumber" class="mono" value="${editing?esc(editing.partNumber):''}" placeholder="${t('partNumberPlaceholder')}"></div>
     <div class="field"><label>${t('notesLabel')}</label><textarea id="pNotes" rows="2" placeholder="${t('partNotesPlaceholder')}">${editing?esc(editing.notes):''}</textarea></div>
@@ -2894,7 +3042,7 @@ function openAddRepairModal(){
     <div class="field"><label>${t('descriptionLabel')}</label><input id="rDesc" placeholder="${t('descriptionPlaceholder')}"></div>
     <div class="row">
       <div class="field"><label>${t('dateLabel')}</label><input id="rDate" type="date" value="${today}"></div>
-      <div class="field"><label>${t('priceLabel')}</label><input id="rPrice" type="number" step="0.01" placeholder="0.00"></div>
+      <div class="field"><label>${t('priceLabel')}</label><input id="rPrice" type="text" inputmode="decimal" oninput="sanitizePriceInput(this)" placeholder="0.00"></div>
     </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeModal()">${t('cancelBtn')}</button>
@@ -2964,7 +3112,7 @@ function tabMaintHtml(v){
     }
     return `<div class="list-row">
       <div>
-        <div class="title">${esc(m.task)}</div>
+        <div class="title">${esc(maintTypeLabel(m.task))}</div>
         <div class="sub">${m.dueDate? t('dueLabel',{date:esc(m.dueDate)}) : ''}${m.notes? ' · '+esc(m.notes):''}</div>
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
@@ -2990,7 +3138,11 @@ function tabMaintHtml(v){
 function openAddScheduleModal(){
   showModal(`
     <h3 style="margin-top:0;">${t('scheduleMaintenanceTitle')}</h3>
-    <div class="field"><label>${t('taskLabel')}</label><input id="mTask" placeholder="${t('taskPlaceholder')}"></div>
+    <div class="field"><label>${t('maintenanceTypeLabel')}</label>
+      <select id="mTask">
+        ${MAINTENANCE_TYPES.map(mt=>`<option value="${mt.id}">${esc(maintTypeLabel(mt.id))}</option>`).join('')}
+      </select>
+    </div>
     <div class="field"><label>${t('dueDateLabel')}</label><input id="mDue" type="date"></div>
     <div class="field"><label>${t('notesLabel')}</label><textarea id="mNotes" rows="2" placeholder="${t('maintNotesPlaceholder')}"></textarea></div>
     <div class="modal-actions">
@@ -3001,7 +3153,7 @@ function openAddScheduleModal(){
 }
 function saveScheduleItem(){
   const v = currentVehicle();
-  const task = $('mTask').value.trim();
+  const task = $('mTask').value;
   if(!task){ alert(t('taskRequiredAlert')); return; }
   const dueDate = $('mDue').value;
   v.maintenanceSchedule = v.maintenanceSchedule || [];
@@ -3010,10 +3162,11 @@ function saveScheduleItem(){
   closeModal();
   renderDetailTabContent();
   const vehicleLabel = `${v.year||''} ${v.model||t('unnamedVehicle')}`.trim();
+  const taskLabel = maintTypeLabel(task);
   showToast({
     kind:'info',
     title: t('toastScheduledTitle'),
-    subtitle: dueDate ? `${task} — ${vehicleLabel} — ${t('dueLabel',{date:dueDate})}` : `${task} — ${vehicleLabel}`,
+    subtitle: dueDate ? `${taskLabel} — ${vehicleLabel} — ${t('dueLabel',{date:dueDate})}` : `${taskLabel} — ${vehicleLabel}`,
   });
 }
 function deleteMaintSchedule(id){
@@ -3026,7 +3179,9 @@ function deleteMaintSchedule(id){
 // form (type, who, when are all captured for real) instead of silently
 // logging it with a freeform task name.
 function completeMaintenance(vehicleId, scheduleId){
-  openCreateMaintenanceReportModal(vehicleId, scheduleId);
+  const v = findVehicleById(vehicleId);
+  const item = (v.maintenanceSchedule||[]).find(m=>m.id===scheduleId);
+  openCreateMaintenanceReportModal(vehicleId, scheduleId, item?item.task:null);
 }
 
 /* ---- MAINTENANCE REPORTS (structured, server-tracked) ---- */
@@ -3041,9 +3196,9 @@ function maintenanceLogRowHtml(m, vehicleId, showUnit){
     <span class="plate-chevron"><svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
   </div>`;
 }
-function openCreateMaintenanceReportModal(vehicleId, scheduleIdToRemove){
+function openCreateMaintenanceReportModal(vehicleId, scheduleIdToRemove, presetType){
   const me = getCurrentUser();
-  const typeOptions = MAINTENANCE_TYPES.map(mt=>`<option value="${mt.id}">${esc(maintTypeLabel(mt.id))}</option>`).join('');
+  const typeOptions = MAINTENANCE_TYPES.map(mt=>`<option value="${mt.id}" ${presetType===mt.id?'selected':''}>${esc(maintTypeLabel(mt.id))}</option>`).join('');
   showModal(`
     <h3 style="margin-top:0;">${t('createMaintenanceReportTitle')}</h3>
     <div class="field"><label>${t('maintenanceTypeLabel')} <span style="color:var(--danger);">*</span></label>
@@ -3479,33 +3634,27 @@ function renderGlobalWorkOrders(){
 }
 /* =========================================================
    WORK PERMITS (Hot Work / Enclosed Space / Height Work)
+   Standalone safety documents — not tied to any unit. Any user can
+   request one; only Admins/Fleet Managers/Supervisors/Technicians with
+   the canApprovePermits capability can approve or close it.
    ========================================================= */
 function permitStatusBadge(status){
   if(status==='closed') return `<span class="badge badge-ok">${t('permitStatusClosed')}</span>`;
   if(status==='approved') return `<span class="badge badge-due">${t('permitStatusApproved')}</span>`;
   return `<span class="badge badge-overdue">${t('permitStatusRequested')}</span>`;
 }
-function permitRowHtml(p, showUnit){
+function permitRowHtml(p){
   const dateStr = p.requestedAt ? new Date(p.requestedAt).toLocaleDateString() : '';
-  return `<div class="list-row" style="cursor:pointer;" onclick="openPermitDetailView('${p.vehicleId}','${p.id}')">
+  return `<div class="list-row" style="cursor:pointer;" onclick="openPermitDetailView('${p.id}')">
     <div style="min-width:0;">
-      <div class="title">${permitTypeIcon(p.type)} ${esc(permitTypeLabel(p.type))}${showUnit && p.unitNumber ? ' · '+esc(p.unitNumber) : ''}</div>
+      <div class="title">${permitTypeIcon(p.type)} ${esc(permitTypeLabel(p.type))}</div>
       <div class="sub">${esc(t('requestedByPrefix'))} ${esc(p.requestedByName||'—')} — ${esc(dateStr)}</div>
     </div>
     ${permitStatusBadge(p.status)}
   </div>`;
 }
-function tabPermitsHtml(v){
-  const permits = (v.permits||[]).slice().sort((a,b)=>(b.requestedAt||0)-(a.requestedAt||0));
-  const rows = permits.map(p=> permitRowHtml(p, false)).join('');
-  return `
-    <div class="section-title" style="margin-top:0;">${t('permitsTitle')}</div>
-    <div class="card">${rows || `<div class="empty-state" style="padding:20px;">${t('noPermitsYet')}</div>`}</div>
-    <button class="btn btn-block" style="margin-top:16px;" onclick="openRequestPermitModal('${v.id}')">${t('requestPermitAction')}</button>
-  `;
-}
 
-function openRequestPermitModal(vehicleId){
+function openRequestPermitModal(){
   showModal(`
     <h3 style="margin-top:0;">${t('requestPermitTitle')}</h3>
     <div class="field"><label>${t('permitTypeLabel')}</label>
@@ -3538,11 +3687,11 @@ function openRequestPermitModal(vehicleId){
     </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeModal()">${t('cancelBtn')}</button>
-      <button class="btn" id="submitPermitBtn" onclick="submitPermitRequest('${vehicleId}')">${t('submitRequestBtn')}</button>
+      <button class="btn" id="submitPermitBtn" onclick="submitPermitRequest()">${t('submitRequestBtn')}</button>
     </div>
   `);
 }
-async function submitPermitRequest(vehicleId){
+async function submitPermitRequest(){
   const type = $('permType').value;
   const workDescription = $('permDescription').value.trim();
   if(!workDescription){ alert(t('workDescRequiredAlert')); return; }
@@ -3560,14 +3709,13 @@ async function submitPermitRequest(vehicleId){
   const btn = $('submitPermitBtn');
   if(btn) btn.disabled = true;
   try{
-    const res = await apiFetch(`/api/vehicles/${vehicleId}/permits`, {method:'POST', body: JSON.stringify({type, data})});
-    const v = findVehicleById(vehicleId);
-    v.permits = v.permits || [];
-    v.permits.push(res.permit);
+    const res = await apiFetch('/api/permits', {method:'POST', body: JSON.stringify({type, data})});
+    DB.permits = DB.permits || [];
+    DB.permits.push(res.permit);
     closeModal();
-    refreshAfterWorkOrderChange();
+    if(state.view==='permits') renderGlobalPermits();
     showToast({ kind:'due', icon:'📋', title: t('toastPermitRequestedTitle'), subtitle: permitTypeLabel(type),
-      onClick: ()=> openPermitDetailView(vehicleId, res.permit.id) });
+      onClick: ()=> openPermitDetailView(res.permit.id) });
   }catch(e){
     alert(e.message || t('registerFailed'));
   }finally{
@@ -3576,52 +3724,44 @@ async function submitPermitRequest(vehicleId){
 }
 
 // Full-screen permit view (too much content for a modal) — reuses the
-// vehicle detail screen shell, with its own back action.
-let _permitDetailReturn = null;
-function openPermitDetailView(vehicleId, permitId){
-  _permitDetailReturn = { screenDetailWasOpen: !$('screen-detail').classList.contains('hidden'), view: state.view };
-  state.currentPermitVehicleId = vehicleId;
+// vehicle detail screen shell purely for layout; always returns to the
+// Permits list on close, since permits aren't tied to a unit.
+function openPermitDetailView(permitId){
   state.currentPermitId = permitId;
   $('screen-main').classList.add('hidden');
   $('screen-detail').classList.remove('hidden');
+  $('deleteVehicleBtn').classList.add('hidden');
   renderPermitDetailView();
 }
 function closePermitDetailView(){
+  state.currentPermitId = null;
   $('screen-detail').classList.add('hidden');
   $('screen-main').classList.remove('hidden');
-  if(_permitDetailReturn && _permitDetailReturn.screenDetailWasOpen){
-    $('screen-detail').classList.remove('hidden');
-    $('screen-main').classList.add('hidden');
-    renderDetail();
-  } else {
-    renderMain();
-  }
+  $('deleteVehicleBtn').classList.remove('hidden');
+  if(state.view!=='permits') state.view = 'permits';
+  renderGlobalPermits();
+  persistNavState();
 }
 function renderPermitDetailView(){
-  const v = findVehicleById(state.currentPermitVehicleId);
-  const p = v && (v.permits||[]).find(x=>x.id===state.currentPermitId);
-  if(!v || !p){ closePermitDetailView(); return; }
+  const p = (DB.permits||[]).find(x=>x.id===state.currentPermitId);
+  if(!p){ closePermitDetailView(); return; }
   $('detailHeaderLabel').textContent = permitTypeLabel(p.type);
-  $('deleteVehicleBtn').classList.add('hidden');
-  $('detailUnit').classList.toggle('hidden', !v.unitNumber);
-  if(v.unitNumber) $('detailUnit').textContent = `${t('unitBadgePrefix')} ${v.unitNumber}`;
+  $('detailUnit').classList.add('hidden');
   $('detailTitle').textContent = permitTypeLabel(p.type);
   $('detailVin').textContent = '';
   $('tabStrip').innerHTML = '';
-  $('detailContent').innerHTML = permitDetailHtml(v, p);
+  $('detailContent').innerHTML = permitDetailHtml(p);
+  persistNavState();
 }
-// Wire the back button to close the permit view instead of the vehicle when active.
 function goBackFromDetailOrPermit(){
   if(state.currentPermitId){
-    state.currentPermitId = null; state.currentPermitVehicleId = null;
-    $('deleteVehicleBtn').classList.remove('hidden');
     closePermitDetailView();
   } else {
     goBackFromDetail();
   }
 }
 
-function permitDetailHtml(v, p){
+function permitDetailHtml(p){
   const d = p.data || {};
   const dateStr = (ts)=> ts ? new Date(ts).toLocaleString() : '—';
   let html = `<div class="section-title" style="margin-top:0;">${permitStatusBadge(p.status)}</div>`;
@@ -3640,7 +3780,7 @@ function permitDetailHtml(v, p){
 
   if(p.status==='requested'){
     if(can('canApprovePermits')){
-      html += `<button class="btn btn-block" style="margin-top:16px;" onclick="openApprovePermitModal('${v.id}','${p.id}')">${t('approvePermitAction')}</button>`;
+      html += `<button class="btn btn-block" style="margin-top:16px;" onclick="openApprovePermitModal('${p.id}')">${t('approvePermitAction')}</button>`;
     } else {
       html += `<div class="empty-state" style="padding:16px;"><div class="glyph">⏳</div>${t('awaitingApprovalNote')}</div>`;
     }
@@ -3690,7 +3830,7 @@ function permitDetailHtml(v, p){
   }
   html += `</div>`;
   if(p.status==='approved' && can('canApprovePermits')){
-    html += `<button class="btn btn-secondary btn-block" style="margin-top:10px;" onclick="openAddReadingModal('${v.id}','${p.id}')">${t('addReadingAction')}</button>`;
+    html += `<button class="btn btn-secondary btn-block" style="margin-top:10px;" onclick="openAddReadingModal('${p.id}')">${t('addReadingAction')}</button>`;
   }
 
   html += `<div class="section-title">${t('controleFinalTitle')}</div><div class="card">`;
@@ -3701,7 +3841,7 @@ function permitDetailHtml(v, p){
   html += `</div>`;
 
   if(p.status==='approved' && can('canApprovePermits')){
-    html += `<button class="btn btn-block" style="margin-top:16px;" onclick="openClosePermitModal('${v.id}','${p.id}')">${t('closePermitAction')}</button>`;
+    html += `<button class="btn btn-block" style="margin-top:16px;" onclick="openClosePermitModal('${p.id}')">${t('closePermitAction')}</button>`;
   }
   return html;
 }
@@ -3709,7 +3849,7 @@ function infoRow(label, value){
   return `<div class="field" style="margin-bottom:10px;"><label>${label}</label><div class="card" style="padding:9px 11px;white-space:pre-wrap;">${esc(value)||'—'}</div></div>`;
 }
 
-function openApprovePermitModal(vehicleId, permitId){
+function openApprovePermitModal(permitId){
   let checklistHtml = '';
   HOT_WORK_SECTIONS.forEach(sec=>{
     const items = HOT_WORK_CHECKLIST.filter(i=>i.section===sec.id);
@@ -3748,11 +3888,11 @@ function openApprovePermitModal(vehicleId, permitId){
     <div class="field"><label>${t('attestationNameLabel')} <span style="color:var(--danger);">*</span></label><input id="apAttestation" placeholder="${t('attestationPlaceholder')}"></div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeModal()">${t('cancelBtn')}</button>
-      <button class="btn" id="submitApproveBtn" onclick="submitApprovePermit('${vehicleId}','${permitId}')">${t('approvePermitAction')}</button>
+      <button class="btn" id="submitApproveBtn" onclick="submitApprovePermit('${permitId}')">${t('approvePermitAction')}</button>
     </div>
   `);
 }
-async function submitApprovePermit(vehicleId, permitId){
+async function submitApprovePermit(permitId){
   const attestationName = $('apAttestation').value.trim();
   if(!attestationName){ alert(t('attestationRequiredAlert')); return; }
   const preventiveMeasures = {};
@@ -3776,12 +3916,10 @@ async function submitApprovePermit(vehicleId, permitId){
   if(btn) btn.disabled = true;
   try{
     const res = await apiFetch(`/api/permits/${permitId}/approve`, {method:'PATCH', body: JSON.stringify({data})});
-    const v = findVehicleById(vehicleId);
-    const idx = (v.permits||[]).findIndex(x=>x.id===permitId);
-    if(idx>=0) v.permits[idx] = res.permit;
+    const idx = (DB.permits||[]).findIndex(x=>x.id===permitId);
+    if(idx>=0) DB.permits[idx] = res.permit;
     closeModal();
     if(state.currentPermitId===permitId) renderPermitDetailView();
-    refreshAfterWorkOrderChange();
     showToast({ kind:'info', icon:'✅', title: t('toastPermitApprovedTitle') });
   }catch(e){
     alert(e.message || t('registerFailed'));
@@ -3790,7 +3928,7 @@ async function submitApprovePermit(vehicleId, permitId){
   }
 }
 
-function openAddReadingModal(vehicleId, permitId){
+function openAddReadingModal(permitId){
   showModal(`
     <h3 style="margin-top:0;">${t('addReadingAction')}</h3>
     <div class="row">
@@ -3804,11 +3942,11 @@ function openAddReadingModal(vehicleId, permitId){
     <div class="field"><label>${t('initialsLabel')}</label><input id="rdInitials"></div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeModal()">${t('cancelBtn')}</button>
-      <button class="btn" onclick="submitReading('${vehicleId}','${permitId}')">${t('saveBtn')}</button>
+      <button class="btn" onclick="submitReading('${permitId}')">${t('saveBtn')}</button>
     </div>
   `);
 }
-async function submitReading(vehicleId, permitId){
+async function submitReading(permitId){
   const reading = {
     o2: $('rdO2').value.trim(), co: $('rdCO').value.trim(),
     h2s: $('rdH2S').value.trim(), lie: $('rdLIE').value.trim(),
@@ -3816,9 +3954,8 @@ async function submitReading(vehicleId, permitId){
   };
   try{
     const res = await apiFetch(`/api/permits/${permitId}/readings`, {method:'POST', body: JSON.stringify({reading})});
-    const v = findVehicleById(vehicleId);
-    const idx = (v.permits||[]).findIndex(x=>x.id===permitId);
-    if(idx>=0) v.permits[idx] = res.permit;
+    const idx = (DB.permits||[]).findIndex(x=>x.id===permitId);
+    if(idx>=0) DB.permits[idx] = res.permit;
     closeModal();
     if(state.currentPermitId===permitId) renderPermitDetailView();
   }catch(e){
@@ -3826,7 +3963,7 @@ async function submitReading(vehicleId, permitId){
   }
 }
 
-function openClosePermitModal(vehicleId, permitId){
+function openClosePermitModal(permitId){
   showModal(`
     <h3 style="margin-top:0;">${t('closePermitTitle')}</h3>
     <div class="field"><label>${t('workCompletedLabel')}</label>
@@ -3840,11 +3977,11 @@ function openClosePermitModal(vehicleId, permitId){
     </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeModal()">${t('cancelBtn')}</button>
-      <button class="btn" id="submitCloseBtn" onclick="submitClosePermit('${vehicleId}','${permitId}')">${t('closePermitAction')}</button>
+      <button class="btn" id="submitCloseBtn" onclick="submitClosePermit('${permitId}')">${t('closePermitAction')}</button>
     </div>
   `);
 }
-async function submitClosePermit(vehicleId, permitId){
+async function submitClosePermit(permitId){
   const data = {
     workCompleted: $('clWorkCompleted').value==='yes',
     monitored60min: $('clMonitored60').value==='yes',
@@ -3854,12 +3991,10 @@ async function submitClosePermit(vehicleId, permitId){
   if(btn) btn.disabled = true;
   try{
     const res = await apiFetch(`/api/permits/${permitId}/close`, {method:'PATCH', body: JSON.stringify({data})});
-    const v = findVehicleById(vehicleId);
-    const idx = (v.permits||[]).findIndex(x=>x.id===permitId);
-    if(idx>=0) v.permits[idx] = res.permit;
+    const idx = (DB.permits||[]).findIndex(x=>x.id===permitId);
+    if(idx>=0) DB.permits[idx] = res.permit;
     closeModal();
     if(state.currentPermitId===permitId) renderPermitDetailView();
-    refreshAfterWorkOrderChange();
     showToast({ kind:'info', icon:'🔒', title: t('toastPermitClosedTitle') });
   }catch(e){
     alert(e.message || t('registerFailed'));
@@ -3868,14 +4003,7 @@ async function submitClosePermit(vehicleId, permitId){
   }
 }
 
-/* ---- GLOBAL PERMITS (hamburger menu) ---- */
-function allPermitsFlat(){
-  const out = [];
-  DB.vehicles.forEach(v=>{
-    (v.permits||[]).forEach(p=> out.push(Object.assign({}, p)));
-  });
-  return out.sort((a,b)=>(b.requestedAt||0)-(a.requestedAt||0));
-}
+/* ---- GLOBAL PERMITS (hamburger menu — the only way to reach permits) ---- */
 function goToPermits(){
   closeDrawer();
   state.view = 'permits';
@@ -3886,17 +4014,19 @@ function goToPermits(){
 }
 function renderGlobalPermits(){
   state.view = 'permits';
-  $('fabAdd').classList.add('hidden');
-  const permits = allPermitsFlat();
+  $('fabAdd').classList.remove('hidden');
+  $('fabAdd').onclick = openRequestPermitModal;
+  const permits = (DB.permits||[]).slice().sort((a,b)=>(b.requestedAt||0)-(a.requestedAt||0));
   let html = `<div class="section-title" style="margin-top:0;">${t('permitsTitle')}</div>`;
   if(!permits.length){
     html += `<div class="empty-state"><div class="glyph">📋</div>${t('noPermitsYet')}</div>`;
   } else {
-    html += `<div class="card">` + permits.map(p=> permitRowHtml(p, true)).join('') + `</div>`;
+    html += `<div class="card">` + permits.map(p=> permitRowHtml(p)).join('') + `</div>`;
   }
   $('mainContent').innerHTML = html;
 }
 /* PERMITS_INSERT_MARKER */
+
 
 /* =========================================================
    CALENDAR & APPOINTMENTS
